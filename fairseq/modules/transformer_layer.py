@@ -63,11 +63,17 @@ class TransformerEncoderLayer(nn.Module):
         return quant_noise(nn.Linear(input_dim, output_dim), p=q_noise, block_size=qn_block_size)
 
     def build_self_attention(self, embed_dim, args):
+        collaborative_heads = "encoder" in args.collaborative_heads
+        key_dim = args.key_dim or embed_dim
+        if collaborative_heads:
+            print(f"Encoder uses collaborative heads with key_dim={key_dim}.")
         return MultiheadAttention(
             embed_dim,
             args.encoder_attention_heads,
+            collaborative_heads=collaborative_heads,
+            kdim=args.key_dim,
             dropout=args.attention_dropout,
-            self_attention=True,
+            self_attention=False, # True,
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
         )
@@ -217,22 +223,33 @@ class TransformerDecoderLayer(nn.Module):
         return quant_noise(nn.Linear(input_dim, output_dim), q_noise, qn_block_size)
 
     def build_self_attention(self, embed_dim, args, add_bias_kv=False, add_zero_attn=False):
+        collaborative_heads = "decoder" in args.collaborative_heads
+        key_dim = args.key_dim or embed_dim
+        if collaborative_heads:
+            print(f"Decoder uses collaborative heads with key_dim={key_dim}.")
         return MultiheadAttention(
             embed_dim,
             args.decoder_attention_heads,
+            collaborative_heads=collaborative_heads,
+            kdim=key_dim,
             dropout=args.attention_dropout,
             add_bias_kv=add_bias_kv,
             add_zero_attn=add_zero_attn,
-            self_attention=not getattr(args, "cross_self_attention", False),
+            self_attention=False, # not getattr(args, "cross_self_attention", False),
             q_noise=self.quant_noise,
             qn_block_size=self.quant_noise_block_size,
         )
 
     def build_encoder_attention(self, embed_dim, args):
+        collaborative_heads = "cross" in args.collaborative_heads
+        key_dim = args.key_dim or embed_dim
+        if collaborative_heads:
+            print(f"Decoder cross attention uses collaborative heads with key_dim={key_dim}.")
         return MultiheadAttention(
             embed_dim,
             args.decoder_attention_heads,
-            kdim=getattr(args, "encoder_embed_dim", None),
+            collaborative_heads=collaborative_heads,
+            kdim=key_dim,
             vdim=getattr(args, "encoder_embed_dim", None),
             dropout=args.attention_dropout,
             encoder_decoder_attention=True,

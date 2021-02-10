@@ -136,6 +136,7 @@ setup(
     install_requires=[
         'cffi',
         'cython',
+        'einops',
         'hydra-core',
         'dataclasses',
         'editdistance',

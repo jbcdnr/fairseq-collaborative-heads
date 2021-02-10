@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn import Parameter
+import einops
 
 from fairseq import utils
 from fairseq.incremental_decoding_utils import with_incremental_state
@@ -30,6 +31,7 @@ class MultiheadAttention(nn.Module):
         num_heads,
         kdim=None,
         vdim=None,
+        collaborative_heads=False,
         dropout=0.0,
         bias=True,
         add_bias_kv=False,
@@ -44,16 +46,22 @@ class MultiheadAttention(nn.Module):
         self.kdim = kdim if kdim is not None else embed_dim
         self.vdim = vdim if vdim is not None else embed_dim
         self.qkv_same_dim = self.kdim == embed_dim and self.vdim == embed_dim
+        self.collaborative_heads = collaborative_heads
 
         self.num_heads = num_heads
         self.dropout_module = FairseqDropout(
             dropout, module_name=self.__class__.__name__
         )
 
-        self.head_dim = embed_dim // num_heads
-        assert (
-            self.head_dim * num_heads == self.embed_dim
-        ), "embed_dim must be divisible by num_heads"
+        if self.collaborative_heads:
+            self.head_kdim = self.kdim
+            self.head_dim = embed_dim // num_heads
+        else:
+            self.head_kdim = self.kdim // num_heads
+            self.head_dim = embed_dim // num_heads
+            assert (
+                self.head_dim * num_heads == self.embed_dim
+            ), "embed_dim must be divisible by num_heads"
         self.scaling = self.head_dim ** -0.5
 
         self.self_attention = self_attention
@@ -63,9 +71,12 @@ class MultiheadAttention(nn.Module):
             "Self-attention requires query, key and " "value to be of the same size"
         )
 
-        self.k_proj = quant_noise(nn.Linear(self.kdim, embed_dim, bias=bias), q_noise, qn_block_size)
-        self.v_proj = quant_noise(nn.Linear(self.vdim, embed_dim, bias=bias), q_noise, qn_block_size)
-        self.q_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
+        self.k_proj = quant_noise(nn.Linear(embed_dim, self.kdim, bias=bias), q_noise, qn_block_size)
+        self.v_proj = quant_noise(nn.Linear(embed_dim, self.vdim, bias=bias), q_noise, qn_block_size)
+        self.q_proj = quant_noise(nn.Linear(embed_dim, self.kdim, bias=bias), q_noise, qn_block_size)
+
+        if self.collaborative_heads:
+            self.mixing_matrix = Parameter(torch.Tensor(self.num_heads, self.kdim))
 
         self.out_proj = quant_noise(nn.Linear(embed_dim, embed_dim, bias=bias), q_noise, qn_block_size)
 
@@ -99,6 +110,9 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_uniform_(self.k_proj.weight)
             nn.init.xavier_uniform_(self.v_proj.weight)
             nn.init.xavier_uniform_(self.q_proj.weight)
+
+        if self.collaborative_heads:
+            nn.init.xavier_uniform_(self.mixing_matrix)
 
         nn.init.xavier_uniform_(self.out_proj.weight)
         if self.out_proj.bias is not None:
@@ -145,8 +159,10 @@ class MultiheadAttention(nn.Module):
         assert embed_dim == self.embed_dim
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
 
+        # Do not use the PyTorch multi-head forward implementation
         if (
-            not self.onnx_trace
+            False
+            and not self.onnx_trace
             and not self.tpu  # don't use PyTorch version on TPUs
             and incremental_state is None
             and not static_kv
@@ -228,17 +244,29 @@ class MultiheadAttention(nn.Module):
                     dim=1,
                 )
 
-        q = (
-            q.contiguous()
-            .view(tgt_len, bsz * self.num_heads, self.head_dim)
-            .transpose(0, 1)
-        )
-        if k is not None:
-            k = (
-                k.contiguous()
-                .view(-1, bsz * self.num_heads, self.head_dim)
+        if self.collaborative_heads:
+            q = q.contiguous().transpose(0, 1)
+            # q: (batch_size, tgt_length, kdim)
+        else:
+            q = (
+                q.contiguous()
+                .view(tgt_len, bsz * self.num_heads, self.head_kdim)
                 .transpose(0, 1)
             )
+        if k is not None:
+            if self.collaborative_heads:
+                # if collab multiply by mixing matrix to get per head keys
+                # k: (tgt_length, batch_size, kdim)
+                # mixing_matrix: (num_heads, kdim)
+                k = k.unsqueeze(2) * self.mixing_matrix.unsqueeze(0).unsqueeze(0)
+                k = k.contiguous().view(-1, bsz * self.num_heads, self.kdim).transpose(0, 1)
+                # k: (batch_size * num_heads, tgt_length, kdim)
+            else:
+                k = (
+                    k.contiguous()
+                    .view(-1, bsz * self.num_heads, self.head_kdim)
+                    .transpose(0, 1)
+                )
         if v is not None:
             v = (
                 v.contiguous()
@@ -251,7 +279,7 @@ class MultiheadAttention(nn.Module):
             if "prev_key" in saved_state:
                 _prev_key = saved_state["prev_key"]
                 assert _prev_key is not None
-                prev_key = _prev_key.view(bsz * self.num_heads, -1, self.head_dim)
+                prev_key = _prev_key.view(bsz * self.num_heads, -1, self.head_kdim)
                 if static_kv:
                     k = prev_key
                 else:
@@ -278,7 +306,7 @@ class MultiheadAttention(nn.Module):
                 static_kv=static_kv,
             )
 
-            saved_state["prev_key"] = k.view(bsz, self.num_heads, -1, self.head_dim)
+            saved_state["prev_key"] = k.contiguous().view(bsz, self.num_heads, -1, self.head_kdim)
             saved_state["prev_value"] = v.view(bsz, self.num_heads, -1, self.head_dim)
             saved_state["prev_key_padding_mask"] = key_padding_mask
             # In this branch incremental_state is never None
@@ -316,7 +344,12 @@ class MultiheadAttention(nn.Module):
                     dim=1,
                 )
 
-        attn_weights = torch.bmm(q, k.transpose(1, 2))
+        if self.collaborative_heads:
+            k_per_head = einops.rearrange(k, "(b h) k d -> b h k d", b=bsz)
+            attn_weights = torch.einsum("bqd, bhkd -> bhqk", q, k_per_head)
+            attn_weights = einops.rearrange(attn_weights, "b h q k -> (b h) q k")
+        else:
+            attn_weights = torch.bmm(q, k.transpose(1, 2))
         attn_weights = MultiheadAttention.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]

@@ -107,6 +107,10 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='path to pre-trained encoder embedding')
         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension')
+        parser.add_argument('--key-dim', type=int, metavar='N', default=None,
+                            help='key projection dimension for encoder and decoder')
+        parser.add_argument('--collaborative-heads', type=str, default="",
+                            help='use collaborative heads instead of concatenation in the decoder, encoder or cross')
         parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension for FFN')
         parser.add_argument('--encoder-layers', type=int, metavar='N',
